@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:camera/camera.dart';
 
 void main() {
   runApp(const MyApp());
@@ -33,6 +34,9 @@ class CurrencyDetectorHome extends StatefulWidget {
 
 class _CurrencyDetectorHomeState extends State<CurrencyDetectorHome> {
   String detectedCurrency = "No note detected";
+  CameraController? _cameraController;
+  List<CameraDescription>? _cameras;
+  bool _isCameraInitialized = false;
   
   @override
   void initState() {
@@ -42,70 +46,92 @@ class _CurrencyDetectorHomeState extends State<CurrencyDetectorHome> {
   }
 
   Future<void> _initializeCamera() async {
-    // TODO: Add camera initialization logic
-    // This is where you'll initialize the camera when app opens
+    try {
+      // Get available cameras
+      _cameras = await availableCameras();
+      
+      if (_cameras != null && _cameras!.isNotEmpty) {
+        _cameraController = CameraController(
+          _cameras![0],
+          ResolutionPreset.high,
+          enableAudio: false,
+        );
+        
+        await _cameraController!.initialize();
+        
+        if (mounted) {
+          setState(() {
+            _isCameraInitialized = true;
+          });
+        }
+      }
+    } catch (e) {
+      print('Error initializing camera: $e');
+    }
   }
 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
       backgroundColor: Colors.black,
-      body: SafeArea(
-        child: Column(
-          children: [
-            // Upper Part - Live Camera Feed
-            Expanded(
-              flex: 6,
-              child: Container(
-                width: double.infinity,
-                color: Colors.grey[900],
-                child: Stack(
-                  children: [
-                    // TODO: Replace this with actual camera preview
-                    Center(
-                      child: Icon(
-                        Icons.camera_alt,
-                        size: 80,
-                        color: Colors.white.withOpacity(0.3),
-                      ),
-                    ),
-                    // Camera preview will go here
-                    // CameraPreview(_cameraController),
-                    
-                    // Top indicator
-                    Positioned(
-                      top: 16,
-                      left: 0,
-                      right: 0,
-                      child: Center(
-                        child: Container(
-                          padding: const EdgeInsets.symmetric(
-                            horizontal: 16,
-                            vertical: 8,
-                          ),
-                          decoration: BoxDecoration(
-                            color: Colors.black.withOpacity(0.6),
-                            borderRadius: BorderRadius.circular(20),
-                          ),
-                          child: const Text(
-                            'Hold currency note in frame',
-                            style: TextStyle(
-                              color: Colors.white,
-                              fontSize: 14,
-                              fontWeight: FontWeight.w500,
+      body: Column(
+        children: [
+          // Upper Part - Live Camera Feed (Full Screen)
+          Expanded(
+            flex: 6,
+            child: Stack(
+              children: [
+                // Camera preview
+                SizedBox.expand(
+                  child: _isCameraInitialized && _cameraController != null
+                      ? CameraPreview(_cameraController!)
+                      : Container(
+                          color: Colors.black,
+                          child: Center(
+                            child: Icon(
+                              Icons.camera_alt,
+                              size: 80,
+                              color: Colors.white.withOpacity(0.3),
                             ),
                           ),
                         ),
+                ),
+                  
+                
+                Positioned(
+                  top: MediaQuery.of(context).padding.top + 16,
+                  left: 0,
+                  right: 0,
+                  child: Center(
+                    child: Container(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 16,
+                        vertical: 8,
+                      ),
+                      decoration: BoxDecoration(
+                        color: Colors.black.withOpacity(0.6),
+                        borderRadius: BorderRadius.circular(20),
+                      ),
+                      child: const Text(
+                        'Hold currency note in frame',
+                        style: TextStyle(
+                          color: Colors.white,
+                          fontSize: 14,
+                          fontWeight: FontWeight.w500,
+                        ),
                       ),
                     ),
-                  ],
+                  ),
                 ),
-              ),
+              ],
             ),
-            
-            // Lower Part - Detection Result Display
-            Expanded(
-              flex: 4,
+          ),
+          
+          // Lower Part - Detection Result Display (with SafeArea)
+          Expanded(
+            flex: 4,
+            child: SafeArea(
+              top: false,
               child: Container(
                 width: double.infinity,
                 decoration: BoxDecoration(
@@ -159,15 +185,15 @@ class _CurrencyDetectorHomeState extends State<CurrencyDetectorHome> {
                 ),
               ),
             ),
-          ],
-        ),
+          ),
+        ],
       ),
     );
   }
 
   @override
   void dispose() {
-    // TODO: Dispose camera controller
+    _cameraController?.dispose();
     super.dispose();
   }
 }
