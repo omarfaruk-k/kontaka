@@ -1,7 +1,9 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:camera/camera.dart';
 import 'package:tflite_flutter/tflite_flutter.dart';
 import 'package:image/image.dart' as img;
+import 'package:flutter_tts/flutter_tts.dart';
 import 'dart:typed_data';
 
 void main() {
@@ -36,35 +38,79 @@ class CurrencyDetectorHome extends StatefulWidget {
 }
 
 class _CurrencyDetectorHomeState extends State<CurrencyDetectorHome> {
+  // UI State
   String detectedCurrency = "No note detected";
+  String statusMessage = "Press and hold anywhere to detect";
+  bool isPressing = false;
+  bool isResultLocked = false;
+  double currentConfidence = 0.0;
+  
+  // Camera
   CameraController? _cameraController;
   List<CameraDescription>? _cameras;
   bool _isCameraInitialized = false;
   
-  // TFLite variables
+  // TFLite
   Interpreter? _interpreter;
   List<String> _labels = [];
   
-  // Processing control
+  // Processing Control - TUNABLE VALUES
   bool _isProcessing = false;
   DateTime _lastProcessTime = DateTime.now();
-  final int _processingInterval = 500; // Process every 500ms
+  final int _processingInterval = 300; // 300ms between frames
+  final int _requiredConsecutiveMatches = 3; // Need 3 same results
+  final double _confidenceThreshold = 0.80; // 80% confidence to lock
+  final int _timeoutSeconds = 10; // Show help after 10 seconds
   
+  // Stability Tracking
+  List<String> _recentPredictions = [];
+  List<double> _recentConfidences = [];
+  DateTime? _pressStartTime;
+  
+  // TTS
+  FlutterTts _flutterTts = FlutterTts();
+  bool _hasSpoken = false;
+  
+  // Debug mode
+  final bool _debugMode = true; // Set to false for production
+
   @override
   void initState() {
     super.initState();
     _initializeCamera();
     _loadModel();
+    _initializeTts();
   }
 
-  // Load TFLite model and labels
+  Future<void> _initializeTts() async {
+    try {
+      await _flutterTts.setLanguage("en-US");
+      await _flutterTts.setSpeechRate(0.5);
+      await _flutterTts.setVolume(1.0);
+      await _flutterTts.setPitch(1.0);
+      print('✅ TTS initialized');
+    } catch (e) {
+      print('❌ Error initializing TTS: $e');
+    }
+  }
+
+  Future<void> _speak(String text) async {
+    try {
+      if (!_hasSpoken) {
+        await _flutterTts.speak(text);
+        _hasSpoken = true;
+        print('🔊 Speaking: $text');
+      }
+    } catch (e) {
+      print('❌ Error speaking: $e');
+    }
+  }
+
   Future<void> _loadModel() async {
     try {
-      // Load the model
       _interpreter = await Interpreter.fromAsset('assets/currency_model.tflite');
       print('✅ Model loaded successfully');
       
-      // Load labels
       _labels = [
         '10 Taka',
         '100 Taka',
@@ -89,7 +135,7 @@ class _CurrencyDetectorHomeState extends State<CurrencyDetectorHome> {
       if (_cameras != null && _cameras!.isNotEmpty) {
         _cameraController = CameraController(
           _cameras![0],
-          ResolutionPreset.medium, // Use medium for better performance
+          ResolutionPreset.medium,
           enableAudio: false,
         );
         
@@ -100,7 +146,7 @@ class _CurrencyDetectorHomeState extends State<CurrencyDetectorHome> {
             _isCameraInitialized = true;
           });
           
-          // Start processing frames
+          // Start camera stream (always running, but only process when pressing)
           _startImageStream();
         }
       }
@@ -109,34 +155,48 @@ class _CurrencyDetectorHomeState extends State<CurrencyDetectorHome> {
     }
   }
 
-  // Start processing camera frames
   void _startImageStream() {
     if (_cameraController == null || !_cameraController!.value.isInitialized) {
       return;
     }
 
     _cameraController!.startImageStream((CameraImage image) {
-      // Time-based control: Only process if 500ms have passed
+      // Only process if user is pressing AND result not locked
+      if (!isPressing || isResultLocked) {
+        return;
+      }
+      
+      // Check timeout
+      if (_pressStartTime != null) {
+        final holdDuration = DateTime.now().difference(_pressStartTime!).inSeconds;
+        if (holdDuration >= _timeoutSeconds && !isResultLocked) {
+          if (mounted) {
+            setState(() {
+              statusMessage = "Try better lighting or hold note flatter";
+            });
+          }
+        }
+      }
+      
+      // Time-based control
       final now = DateTime.now();
       final timeSinceLastProcess = now.difference(_lastProcessTime).inMilliseconds;
       
       if (timeSinceLastProcess < _processingInterval) {
-        return; // Skip this frame
+        return;
       }
       
-      // Flag-based control: Only process if not already processing
+      // Flag-based control
       if (_isProcessing) {
-        return; // Skip this frame
+        return;
       }
       
-      // Process this frame
       _isProcessing = true;
       _lastProcessTime = now;
       _processImage(image);
     });
   }
 
-  // Process camera image
   Future<void> _processImage(CameraImage image) async {
     try {
       if (_interpreter == null) {
@@ -144,45 +204,103 @@ class _CurrencyDetectorHomeState extends State<CurrencyDetectorHome> {
         return;
       }
 
-      // Convert CameraImage to image format
       final img.Image? convertedImage = _convertCameraImage(image);
       if (convertedImage == null) {
         _isProcessing = false;
         return;
       }
 
-      // Resize to 224x224 (model input size)
       final img.Image resizedImage = img.copyResize(
         convertedImage,
         width: 224,
         height: 224,
       );
 
-      // Preprocess: normalize to [-1, 1] (MobileNetV2 preprocessing)
       final input = _preprocessImage(resizedImage);
-
-      // Prepare output buffer
       var output = List.filled(1 * 9, 0.0).reshape([1, 9]);
 
-      // Run inference
       _interpreter!.run(input, output);
 
-      // Get prediction
       final probabilities = output[0] as List<double>;
       final maxIndex = probabilities.indexOf(probabilities.reduce((a, b) => a > b ? a : b));
       final confidence = probabilities[maxIndex];
+      final predictedLabel = _labels[maxIndex];
 
-      // Update UI only if confidence is good
-      if (confidence > 0.8) { // 60% confidence threshold
+      if (mounted) {
+        setState(() {
+          currentConfidence = confidence;
+        });
+      }
+
+      // Confidence-based processing
+      if (confidence >= _confidenceThreshold) {
+        // High confidence - add to recent predictions
+        _recentPredictions.add(predictedLabel);
+        _recentConfidences.add(confidence);
+        
+        // Keep only last required matches
+        if (_recentPredictions.length > _requiredConsecutiveMatches) {
+          _recentPredictions.removeAt(0);
+          _recentConfidences.removeAt(0);
+        }
+        
+        // Check for consistency
+        if (_recentPredictions.length >= _requiredConsecutiveMatches) {
+          final firstPrediction = _recentPredictions[0];
+          final allMatch = _recentPredictions.every((p) => p == firstPrediction);
+          
+          if (allMatch) {
+            // LOCK RESULT!
+            final avgConfidence = _recentConfidences.reduce((a, b) => a + b) / _recentConfidences.length;
+            
+            // Haptic feedback - success vibration
+            HapticFeedback.mediumImpact();
+            
+            if (mounted) {
+              setState(() {
+                detectedCurrency = firstPrediction;
+                isResultLocked = true;
+                statusMessage = "✓ Result confirmed! Release to scan again";
+                currentConfidence = avgConfidence;
+              });
+            }
+            
+            // Speak the result
+            _speak(firstPrediction);
+            
+            print('🔒 LOCKED: $firstPrediction (${(avgConfidence * 100).toStringAsFixed(1)}%)');
+          } else {
+            // Not all match, keep scanning
+            if (mounted) {
+              setState(() {
+                statusMessage = "Scanning... Hold steady";
+              });
+            }
+          }
+        } else {
+          // Still collecting predictions
+          if (mounted) {
+            setState(() {
+              statusMessage = "Scanning... (${_recentPredictions.length}/$_requiredConsecutiveMatches)";
+            });
+          }
+        }
+      } else if (confidence >= 0.60) {
+        // Medium confidence - clear recent and ask to hold steady
+        _recentPredictions.clear();
+        _recentConfidences.clear();
         if (mounted) {
           setState(() {
-            detectedCurrency = _labels[maxIndex];
+            statusMessage = "Hold steady";
           });
         }
       } else {
+        // Low confidence
+        _recentPredictions.clear();
+        _recentConfidences.clear();
         if (mounted) {
           setState(() {
-            detectedCurrency = "No note detected";
+            statusMessage = "No clear note detected";
           });
         }
       }
@@ -194,7 +312,40 @@ class _CurrencyDetectorHomeState extends State<CurrencyDetectorHome> {
     }
   }
 
-  // Convert CameraImage to img.Image
+  // Handle press start
+  void _onPressStart() {
+    // Light haptic feedback
+    HapticFeedback.lightImpact();
+    
+    setState(() {
+      isPressing = true;
+      isResultLocked = false;
+      _recentPredictions.clear();
+      _recentConfidences.clear();
+      _hasSpoken = false;
+      statusMessage = "Scanning...";
+      _pressStartTime = DateTime.now();
+    });
+    
+    print('👆 Press started');
+  }
+
+  // Handle press end
+  void _onPressEnd() {
+    setState(() {
+      isPressing = false;
+      _pressStartTime = null;
+      
+      // Keep last result visible
+      if (!isResultLocked) {
+        statusMessage = "Press and hold anywhere to detect";
+        // Don't reset detectedCurrency - keep last result visible
+      }
+    });
+    
+    print('👆 Press ended');
+  }
+
   img.Image? _convertCameraImage(CameraImage image) {
     try {
       if (image.format.group == ImageFormatGroup.yuv420) {
@@ -209,7 +360,6 @@ class _CurrencyDetectorHomeState extends State<CurrencyDetectorHome> {
     }
   }
 
-  // Convert YUV420 to RGB
   img.Image _convertYUV420ToImage(CameraImage image) {
     final int width = image.width;
     final int height = image.height;
@@ -238,7 +388,6 @@ class _CurrencyDetectorHomeState extends State<CurrencyDetectorHome> {
     return convertedImage;
   }
 
-  // Convert BGRA8888 to RGB
   img.Image _convertBGRA8888ToImage(CameraImage image) {
     return img.Image.fromBytes(
       width: image.width,
@@ -248,7 +397,6 @@ class _CurrencyDetectorHomeState extends State<CurrencyDetectorHome> {
     );
   }
 
-  // Preprocess image: normalize to [-1, 1]
   List<List<List<List<double>>>> _preprocessImage(img.Image image) {
     final input = List.generate(
       1,
@@ -265,7 +413,6 @@ class _CurrencyDetectorHomeState extends State<CurrencyDetectorHome> {
       for (int x = 0; x < 224; x++) {
         final pixel = image.getPixel(x, y);
         
-        // Normalize from [0, 255] to [-1, 1] (MobileNetV2 preprocessing)
         input[0][y][x][0] = (pixel.r / 127.5) - 1.0;
         input[0][y][x][1] = (pixel.g / 127.5) - 1.0;
         input[0][y][x][2] = (pixel.b / 127.5) - 1.0;
@@ -279,117 +426,210 @@ class _CurrencyDetectorHomeState extends State<CurrencyDetectorHome> {
   Widget build(BuildContext context) {
     return Scaffold(
       backgroundColor: Colors.black,
-      body: Column(
-        children: [
-          // Upper Part - Live Camera Feed
-          Expanded(
-            flex: 6,
-            child: Stack(
-              children: [
-                // Camera preview
-                SizedBox.expand(
-                  child: _isCameraInitialized && _cameraController != null
-                      ? CameraPreview(_cameraController!)
-                      : Container(
-                          color: Colors.black,
-                          child: Center(
-                            child: Icon(
-                              Icons.camera_alt,
-                              size: 80,
-                              color: Colors.white.withOpacity(0.3),
+      body: GestureDetector(
+        // Detect press and hold anywhere on screen
+        onTapDown: (_) => _onPressStart(),
+        onTapUp: (_) => _onPressEnd(),
+        onTapCancel: () => _onPressEnd(),
+        child: Column(
+          children: [
+            // Upper Part - Live Camera Feed
+            Expanded(
+              flex: 6,
+              child: Stack(
+                children: [
+                  // Camera preview
+                  SizedBox.expand(
+                    child: _isCameraInitialized && _cameraController != null
+                        ? CameraPreview(_cameraController!)
+                        : Container(
+                            color: Colors.black,
+                            child: Center(
+                              child: Icon(
+                                Icons.camera_alt,
+                                size: 80,
+                                color: Colors.white.withOpacity(0.3),
+                              ),
+                            ),
+                          ),
+                  ),
+                  
+                  // Scanning border overlay (when pressing)
+                  if (isPressing && !isResultLocked)
+                    AnimatedContainer(
+                      duration: Duration(milliseconds: 300),
+                      decoration: BoxDecoration(
+                        border: Border.all(
+                          color: Colors.green,
+                          width: 4,
+                        ),
+                      ),
+                    ),
+                  
+                  // Success overlay (when locked)
+                  if (isResultLocked)
+                    Container(
+                      decoration: BoxDecoration(
+                        border: Border.all(
+                          color: Colors.green,
+                          width: 6,
+                        ),
+                      ),
+                    ),
+                  
+                  // Top instruction text
+                  Positioned(
+                    top: MediaQuery.of(context).padding.top + 16,
+                    left: 0,
+                    right: 0,
+                    child: Center(
+                      child: Container(
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 16,
+                          vertical: 8,
+                        ),
+                        decoration: BoxDecoration(
+                          color: Colors.black.withOpacity(0.7),
+                          borderRadius: BorderRadius.circular(20),
+                        ),
+                        child: Text(
+                          statusMessage,
+                          style: TextStyle(
+                            color: isResultLocked ? Colors.greenAccent : Colors.white,
+                            fontSize: 14,
+                            fontWeight: FontWeight.w500,
+                          ),
+                          textAlign: TextAlign.center,
+                        ),
+                      ),
+                    ),
+                  ),
+                  
+                  // Debug info (top right)
+                  if (_debugMode)
+                    Positioned(
+                      top: MediaQuery.of(context).padding.top + 60,
+                      right: 16,
+                      child: Container(
+                        padding: EdgeInsets.all(8),
+                        decoration: BoxDecoration(
+                          color: Colors.black.withOpacity(0.7),
+                          borderRadius: BorderRadius.circular(8),
+                        ),
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.end,
+                          children: [
+                            Text(
+                              'Confidence: ${(currentConfidence * 100).toStringAsFixed(1)}%',
+                              style: TextStyle(
+                                color: Colors.white,
+                                fontSize: 10,
+                              ),
+                            ),
+                            Text(
+                              'Matches: ${_recentPredictions.length}/$_requiredConsecutiveMatches',
+                              style: TextStyle(
+                                color: Colors.white,
+                                fontSize: 10,
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ),
+                ],
+              ),
+            ),
+            
+            // Lower Part - Detection Result Display
+            Expanded(
+              flex: 4,
+              child: SafeArea(
+                top: false,
+                child: Container(
+                  width: double.infinity,
+                  decoration: BoxDecoration(
+                    color: Colors.white,
+                    borderRadius: const BorderRadius.only(
+                      topLeft: Radius.circular(30),
+                      topRight: Radius.circular(30),
+                    ),
+                  ),
+                  child: Column(
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    children: [
+                      const SizedBox(height: 20),
+                      Row(
+                        mainAxisAlignment: MainAxisAlignment.center,
+                        children: [
+                          Text(
+                            'Detected:',
+                            style: TextStyle(
+                              fontSize: 20,
+                              color: Colors.grey,
+                              fontWeight: FontWeight.w400,
+                            ),
+                          ),
+                          if (isResultLocked)
+                            Padding(
+                              padding: const EdgeInsets.only(left: 8),
+                              child: Icon(
+                                Icons.check_circle,
+                                color: Colors.green,
+                                size: 24,
+                              ),
+                            ),
+                        ],
+                      ),
+                      const SizedBox(height: 16),
+                      Padding(
+                        padding: const EdgeInsets.symmetric(horizontal: 24),
+                        child: Text(
+                          detectedCurrency,
+                          textAlign: TextAlign.center,
+                          style: TextStyle(
+                            fontSize: 48,
+                            fontWeight: FontWeight.bold,
+                            color: detectedCurrency == "No note detected"
+                                ? Colors.grey[400]
+                                : isResultLocked
+                                    ? Colors.green[700]
+                                    : Colors.green[500],
+                            height: 1.2,
+                          ),
+                        ),
+                      ),
+                      const SizedBox(height: 12),
+                      Container(
+                        width: 60,
+                        height: 4,
+                        decoration: BoxDecoration(
+                          color: detectedCurrency == "No note detected"
+                              ? Colors.grey[300]
+                              : isResultLocked
+                                  ? Colors.green[700]
+                                  : Colors.green[400],
+                          borderRadius: BorderRadius.circular(2),
+                        ),
+                      ),
+                      if (_debugMode)
+                        Padding(
+                          padding: const EdgeInsets.only(top: 12),
+                          child: Text(
+                            '${(currentConfidence * 100).toStringAsFixed(1)}% confidence',
+                            style: TextStyle(
+                              fontSize: 12,
+                              color: Colors.grey,
                             ),
                           ),
                         ),
-                ),
-                  
-                Positioned(
-                  top: MediaQuery.of(context).padding.top + 16,
-                  left: 0,
-                  right: 0,
-                  child: Center(
-                    child: Container(
-                      padding: const EdgeInsets.symmetric(
-                        horizontal: 16,
-                        vertical: 8,
-                      ),
-                      decoration: BoxDecoration(
-                        color: Colors.black.withOpacity(0.6),
-                        borderRadius: BorderRadius.circular(20),
-                      ),
-                      child: const Text(
-                        'Hold currency note in frame',
-                        style: TextStyle(
-                          color: Colors.white,
-                          fontSize: 14,
-                          fontWeight: FontWeight.w500,
-                        ),
-                      ),
-                    ),
+                    ],
                   ),
-                ),
-              ],
-            ),
-          ),
-          
-          // Lower Part - Detection Result Display
-          Expanded(
-            flex: 4,
-            child: SafeArea(
-              top: false,
-              child: Container(
-                width: double.infinity,
-                decoration: BoxDecoration(
-                  color: Colors.white,
-                  borderRadius: const BorderRadius.only(
-                    topLeft: Radius.circular(30),
-                    topRight: Radius.circular(30),
-                  ),
-                ),
-                child: Column(
-                  mainAxisAlignment: MainAxisAlignment.center,
-                  children: [
-                    const SizedBox(height: 20),
-                    const Text(
-                      'Detected:',
-                      style: TextStyle(
-                        fontSize: 20,
-                        color: Colors.grey,
-                        fontWeight: FontWeight.w400,
-                      ),
-                    ),
-                    const SizedBox(height: 16),
-                    Padding(
-                      padding: const EdgeInsets.symmetric(horizontal: 24),
-                      child: Text(
-                        detectedCurrency,
-                        textAlign: TextAlign.center,
-                        style: TextStyle(
-                          fontSize: 48,
-                          fontWeight: FontWeight.bold,
-                          color: detectedCurrency == "No note detected"
-                              ? Colors.grey[400]
-                              : Colors.green[700],
-                          height: 1.2,
-                        ),
-                      ),
-                    ),
-                    const SizedBox(height: 12),
-                    Container(
-                      width: 60,
-                      height: 4,
-                      decoration: BoxDecoration(
-                        color: detectedCurrency == "No note detected"
-                            ? Colors.grey[300]
-                            : Colors.green[700],
-                        borderRadius: BorderRadius.circular(2),
-                      ),
-                    ),
-                  ],
                 ),
               ),
             ),
-          ),
-        ],
+          ],
+        ),
       ),
     );
   }
@@ -398,6 +638,7 @@ class _CurrencyDetectorHomeState extends State<CurrencyDetectorHome> {
   void dispose() {
     _cameraController?.dispose();
     _interpreter?.close();
+    _flutterTts.stop();
     super.dispose();
   }
 }
