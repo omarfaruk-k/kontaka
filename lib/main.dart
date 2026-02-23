@@ -63,12 +63,12 @@ class _CurrencyDetectorHomeState extends State<CurrencyDetectorHome> {
   final int _timeoutSeconds = 10; // Show help after 10 seconds
   
   // Stability Tracking
-  List<String> _recentPredictions = [];
-  List<double> _recentConfidences = [];
+  final List<String> _recentPredictions = [];
+  final List<double> _recentConfidences = [];
   DateTime? _pressStartTime;
   
   // TTS
-  FlutterTts _flutterTts = FlutterTts();
+  final FlutterTts _flutterTts = FlutterTts();
   bool _hasSpoken = false;
   
   // Debug mode
