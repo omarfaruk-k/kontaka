@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:camera/camera.dart';
@@ -36,166 +37,107 @@ class CurrencyDetectorHome extends StatefulWidget {
   State<CurrencyDetectorHome> createState() => _CurrencyDetectorHomeState();
 }
 
-class _CurrencyDetectorHomeState extends State<CurrencyDetectorHome> {
-  // UI State
+class _CurrencyDetectorHomeState extends State<CurrencyDetectorHome>
+    with WidgetsBindingObserver {
   String detectedCurrency = "No note detected";
-  String statusMessage = "Press and hold anywhere to detect";
+  String statusMessage = "স্ক্রিনে চাপ দিয়ে ধরুন";
   bool isPressing = false;
   bool isResultLocked = false;
   double currentConfidence = 0.0;
 
-  // Camera
   CameraController? _cameraController;
   List<CameraDescription>? _cameras;
   bool _isCameraInitialized = false;
 
-  // TFLite
   Interpreter? _interpreter;
   List<String> _labels = [];
 
-  // Processing Control - TUNABLE VALUES
   bool _isProcessing = false;
-  final DateTime _lastProcessTime = DateTime.now();
-  final int _processingInterval = 0; // 300ms between frames
-  final int _requiredConsecutiveMatches = 3; // Need 3 same results
-  final double _confidenceThreshold = 0.20; // 80% confidence to lock
-  final int _timeoutSeconds = 10; // Show help after 10 seconds
-  bool _hasPredictedThisPress = false; // NEW — one prediction per press
+  final int _requiredConsecutiveMatches = 3;
+  final double _confidenceThreshold = 0.40;
+  bool _hasPredictedThisPress = false;
 
-  // Stability Tracking
-  final List<String> _recentPredictions = [];
-  final List<double> _recentConfidences = [];
   DateTime? _pressStartTime;
 
-  // TTS
   final FlutterTts _flutterTts = FlutterTts();
   bool _hasSpoken = false;
   bool _readyToScan = false;
 
-  // Debug mode
-  final bool _debugMode = true; // Set to false for production
+  Timer? _resultClearTimer;
+
+  bool _welcomeSpoken = false;
+
+  final bool _debugMode = true;
+
   final Map<String, String> _labelMap = {
-  '1000_tk_v1' : '১০০০ টাকা',
-  '1000_tk_v2' : '১০০০ টাকা',
-  '100_tk'     : '১০০ টাকা',
-  '10_tk'      : '১০ টাকা',
-  '200_tk'     : '২০০ টাকা',
-  '20_tk_v1'   : '২০ টাকা',
-  '20_tk_v2'   : '২০ টাকা',
-  '2_tk_v1'    : '২ টাকা',
-  '2_tk_v2'    : '২ টাকা',
-  '500_tk'     : '৫০০ টাকা',
-  '50_tk_v1'   : '৫০ টাকা',
-  '50_tk_v2'   : '৫০ টাকা',
-  '50_tk_v3'   : '৫০ টাকা',
-  '5_tk_v1'    : '৫ টাকা',
-  '5_tk_v2'    : '৫ টাকা',
-};
+    '1000_tk_v1': '১০০০ টাকা',
+    '1000_tk_v2': '১০০০ টাকা',
+    '100_tk': '১০০ টাকা',
+    '10_tk': '১০ টাকা',
+    '200_tk': '২০০ টাকা',
+    '20_tk_v1': '২০ টাকা',
+    '20_tk_v2': '২০ টাকা',
+    '2_tk_v1': '২ টাকা',
+    '2_tk_v2': '২ টাকা',
+    '500_tk': '৫০০ টাকা',
+    '50_tk_v1': '৫০ টাকা',
+    '50_tk_v2': '৫০ টাকা',
+    '50_tk_v3': '৫০ টাকা',
+    '5_tk_v1': '৫ টাকা',
+    '5_tk_v2': '৫ টাকা',
+  };
+
   @override
   void initState() {
     super.initState();
+    // Register this widget as an observer for app lifecycle changes
+    WidgetsBinding.instance.addObserver(this);
     _initializeCamera();
     _loadModel();
     _initializeTts();
   }
 
-  Future<void> _initializeTts() async {
-    try {
-      await _flutterTts.setLanguage("bn-BD");
-      await _flutterTts.setSpeechRate(0.5);
-      await _flutterTts.setVolume(1.0);
-      await _flutterTts.setPitch(1.0);
-      print('✅ TTS initialized');
-    } catch (e) {
-      print('❌ Error initializing TTS: $e');
+  // ─── LIFECYCLE OBSERVER (Problem 2 fix) ───────────────────────────────────
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    super.didChangeAppLifecycleState(state);
+
+    if (state == AppLifecycleState.inactive ||
+        state == AppLifecycleState.paused) {
+      // App going to background — stop and release camera
+      _stopCamera();
+    } else if (state == AppLifecycleState.resumed) {
+      // App returning to foreground — reinitialize camera
+      _initializeCamera();
     }
   }
 
-  Future<void> _speak(String text) async {
-    try {
-      if (!_hasSpoken) {
-        await _flutterTts.speak(text);
-        _hasSpoken = true;
-        print('🔊 Speaking: $text');
+  Future<void> _stopCamera() async {
+    if (_cameraController != null) {
+      try {
+        if (_cameraController!.value.isStreamingImages) {
+          await _cameraController!.stopImageStream();
+        }
+        await _cameraController!.dispose();
+      } catch (e) {
+        print('Error stopping camera: $e');
+      } finally {
+        _cameraController = null;
+        if (mounted) {
+          setState(() {
+            _isCameraInitialized = false;
+          });
+        }
       }
-    } catch (e) {
-      print('❌ Error speaking: $e');
     }
   }
 
-  // Future<void> _loadModel() async {
-  //   try {
-  //     _interpreter = await Interpreter.fromAsset(
-  //       'assets/currency_model_final.tflite',
-  //     );
-  //     print('✅ Model loaded successfully');
-
-  //     // _labels = [
-  //     //   '10 Taka',
-  //     //   '100 Taka',
-  //     //   '1000 Taka',
-  //     //   '2 Taka',
-  //     //   '20 Taka',
-  //     //   '200 Taka',
-  //     //   '5 Taka',
-  //     //   '50 Taka',
-  //     //   '500 Taka'
-  //     // ];
-  //     _labels = [
-  //       '১০ টাকা',
-  //       '১০০ টাকা',
-  //       '১০০০ টাকা',
-  //       '২ টাকা',
-  //       '২০ টাকা',
-  //       '২০০ টাকা',
-  //       '৫ টাকা',
-  //       '৫০ টাকা',
-  //       '৫০০ টাকা',
-  //     ];
-  //     print('✅ Labels loaded: ${_labels.length} classes');
-  //   } catch (e) {
-  //     print('❌ Error loading model: $e');
-  //   }
-  // }
-
-
-
-
-Future<void> _loadModel() async {
-  try {
-    _interpreter = await Interpreter.fromAsset(
-      'assets/currency_model_final.tflite',
-    );
-    print('✅ Model loaded successfully');
-
-    _labels = [
-      '1000_tk_v1',  // index 0
-      '1000_tk_v2',  // index 1
-      '100_tk',      // index 2
-      '10_tk',       // index 3
-      '200_tk',      // index 4
-      '20_tk_v1',    // index 5
-      '20_tk_v2',    // index 6
-      '2_tk_v1',     // index 7
-      '2_tk_v2',     // index 8
-      '500_tk',      // index 9
-      '50_tk_v1',    // index 10
-      '50_tk_v2',    // index 11
-      '50_tk_v3',    // index 12
-      '5_tk_v1',     // index 13
-      '5_tk_v2',     // index 14
-    ];
-    print('✅ Labels loaded: ${_labels.length} classes');
-  } catch (e) {
-    print('❌ Error loading model: $e');
-  }
-}
-
-
+  // ─── CAMERA INIT ──────────────────────────────────────────────────────────
 
   Future<void> _initializeCamera() async {
     try {
-      _cameras = await availableCameras();
+      _cameras ??= await availableCameras();
 
       if (_cameras != null && _cameras!.isNotEmpty) {
         _cameraController = CameraController(
@@ -211,8 +153,16 @@ Future<void> _loadModel() async {
             _isCameraInitialized = true;
           });
 
-          // Start camera stream (always running, but only process when pressing)
           _startImageStream();
+
+          // Speak welcome message once per session after camera is ready
+          if (!_welcomeSpoken) {
+            _welcomeSpoken = true;
+            // Small delay so TTS doesn't fire before everything loads
+            Future.delayed(const Duration(milliseconds: 800), () {
+              _speakWelcome();
+            });
+          }
         }
       }
     } catch (e) {
@@ -226,137 +176,229 @@ Future<void> _loadModel() async {
     }
 
     _cameraController!.startImageStream((CameraImage image) {
- if (!isPressing || !_readyToScan || _hasPredictedThisPress) return;
-  if (_isProcessing) return;
+      if (!isPressing || !_readyToScan || _hasPredictedThisPress) return;
+      if (_isProcessing) return;
 
-  // Only fire after holding for at least 300ms — prevents accidental taps
-  if (_pressStartTime == null) return;
-  final holdDuration = DateTime.now().difference(_pressStartTime!).inMilliseconds;
-  if (holdDuration < 500) return;
+      if (_pressStartTime == null) return;
+      final holdDuration =
+          DateTime.now().difference(_pressStartTime!).inMilliseconds;
+      if (holdDuration < 100) return;
 
-  _isProcessing = true;
-  _processImage(image);
-  });
+      _isProcessing = true;
+      _processImage(image);
+    });
   }
+
+  // ─── TTS ──────────────────────────────────────────────────────────────────
+
+  Future<void> _initializeTts() async {
+    try {
+      await _flutterTts.setLanguage("bn-BD");
+      await _flutterTts.setSpeechRate(0.5);
+      await _flutterTts.setVolume(1.0);
+      await _flutterTts.setPitch(1.0);
+      print('✅ TTS initialized');
+    } catch (e) {
+      print('❌ Error initializing TTS: $e');
+    }
+  }
+
+  Future<void> _speakWelcome() async {
+    try {
+      // "Hold a note in front of the camera and press the screen"
+      await _flutterTts.speak("ক্যামেরার সামনে নোট ধরুন এবং স্ক্রিনে চাপ দিন");
+    } catch (e) {
+      print('❌ Error speaking welcome: $e');
+    }
+  }
+
+  Future<void> _speak(String text) async {
+    try {
+      if (!_hasSpoken) {
+        await _flutterTts.speak(text);
+        _hasSpoken = true;
+        print('🔊 Speaking: $text');
+      }
+    } catch (e) {
+      print('❌ Error speaking: $e');
+    }
+  }
+
+  // ─── MODEL ────────────────────────────────────────────────────────────────
+
+  Future<void> _loadModel() async {
+    try {
+      _interpreter = await Interpreter.fromAsset(
+        'assets/currency_model_final.tflite',
+      );
+      print('✅ Model loaded successfully');
+
+      _labels = [
+        '1000_tk_v1', // index 0
+        '1000_tk_v2', // index 1
+        '100_tk', // index 2
+        '10_tk', // index 3
+        '200_tk', // index 4
+        '20_tk_v1', // index 5
+        '20_tk_v2', // index 6
+        '2_tk_v1', // index 7
+        '2_tk_v2', // index 8
+        '500_tk', // index 9
+        '50_tk_v1', // index 10
+        '50_tk_v2', // index 11
+        '50_tk_v3', // index 12
+        '5_tk_v1', // index 13
+        '5_tk_v2', // index 14
+      ];
+      print('✅ Labels loaded: ${_labels.length} classes');
+    } catch (e) {
+      print('❌ Error loading model: $e');
+    }
+  }
+
+  // ─── IMAGE PROCESSING ─────────────────────────────────────────────────────
 
   Future<void> _processImage(CameraImage image) async {
-  try {
-    if (_interpreter == null) { _isProcessing = false; return; }
-
-    final img.Image? convertedImage = _convertCameraImage(image);
-    if (convertedImage == null) { _isProcessing = false; return; }
-
-    final img.Image resizedImage = img.copyResize(convertedImage, width: 224, height: 224);
-    final input = _preprocessImage(resizedImage);
-    var output = List.filled(1 * 15, 0.0).reshape([1, 15]);
-    _interpreter!.run(input, output);
-
-    final probabilities = output[0] as List<double>;
-    final maxIndex = probabilities.indexOf(probabilities.reduce((a, b) => a > b ? a : b));
-    final confidence = probabilities[maxIndex];
-    final String rawLabel = _labels[maxIndex];
-    final String predictedLabel = _labelMap[rawLabel] ?? rawLabel;
-
-    // Log all probabilities
-    print('--- FRAME ---');
-    for (int i = 0; i < _labels.length; i++) {
-      print('  ${_labels[i]}: ${(probabilities[i] * 100).toStringAsFixed(2)}%');
-    }
-    print('  ✅ TOP: $rawLabel → $predictedLabel (${(confidence * 100).toStringAsFixed(2)}%)');
-
-    // Only accept if confidence >= your threshold (change 0.50 to whatever you want)
-    if (confidence >= 0.40) {
-      _hasPredictedThisPress = true; // 🔒 stop further processing this press
-
-      HapticFeedback.mediumImpact();
-
-      if (mounted) {
-        setState(() {
-          detectedCurrency = predictedLabel;
-          currentConfidence = confidence;
-          isResultLocked = true;
-          statusMessage = "Release to scan again";
-        });
+      final stopwatch = Stopwatch()..start();
+    try {
+      if (_interpreter == null) {
+        _isProcessing = false;
+        return;
       }
 
-      await _speak(predictedLabel);
-
-    } else {
-      // Confidence too low — keep trying until confident or user releases
-      if (mounted) {
-        setState(() {
-          statusMessage = "Can't detect — adjust position";
-          currentConfidence = confidence;
-        });
+      final img.Image? convertedImage = _convertCameraImage(image);
+      if (convertedImage == null) {
+        _isProcessing = false;
+        return;
       }
-    }
 
-  } catch (e) {
-    print('❌ Error: $e');
-  } finally {
-    _isProcessing = false;
+      final img.Image resizedImage = img.copyResize(
+        convertedImage,
+        width: 224,
+        height: 224,
+      );
+      final input = _preprocessImage(resizedImage);
+      var output = List.filled(1 * 15, 0.0).reshape([1, 15]);
+      _interpreter!.run(input, output);
+      final probabilities = output[0] as List<double>;
+      final maxIndex = probabilities.indexOf(
+        probabilities.reduce((a, b) => a > b ? a : b),
+      );
+      final confidence = probabilities[maxIndex];
+      final String rawLabel = _labels[maxIndex];
+      final String predictedLabel = _labelMap[rawLabel] ?? rawLabel;
+
+      print('--- FRAME ---');
+      for (int i = 0; i < _labels.length; i++) {
+        print(
+          '  ${_labels[i]}: ${(probabilities[i] * 100).toStringAsFixed(2)}%',
+        );
+      }
+      print(
+        '  ✅ TOP: $rawLabel → $predictedLabel (${(confidence * 100).toStringAsFixed(2)}%)',
+      );
+
+      if (confidence >= _confidenceThreshold) {
+        _hasPredictedThisPress = true;
+
+        // Cancel any existing clear timer (user pressed before it expired)
+        _resultClearTimer?.cancel();
+
+        HapticFeedback.mediumImpact();
+
+        if (mounted) {
+          setState(() {
+            detectedCurrency = predictedLabel;
+            currentConfidence = confidence;
+            isResultLocked = true;
+            statusMessage = "Release to scan again";
+          });
+        }
+
+        await _speak(predictedLabel);
+
+        // Start 4-second auto-clear timer (Problem 1)
+        _startResultClearTimer();
+      } else {
+        if (mounted) {
+          setState(() {
+            statusMessage = "সঠিকভাবে ধরুন";
+            currentConfidence = confidence;
+          });
+        }
+      }
+    } catch (e) {
+      print('❌ Error: $e');
+    } finally {
+      stopwatch.stop();
+      print('⏱ Total processing time: ${stopwatch.elapsedMilliseconds}ms');
+      _isProcessing = false;
+
+    }
   }
-}
 
-//   // Handle press start
-// void _onPressStart() {
-//   HapticFeedback.lightImpact();
-//   setState(() {
-//     isPressing = true;
-//     isResultLocked = false;
-//     _hasPredictedThisPress = false;
-//     _hasSpoken = false;
-//     detectedCurrency = "Scanning...";
-//     statusMessage = "Hold steady...";
-//   });
-//   print('👆 Press started');
-// }
-void _onPressStart() {
-  HapticFeedback.lightImpact();
-  setState(() {
-    isPressing = true;
-    isResultLocked = false;
-    _hasPredictedThisPress = false;
-    _hasSpoken = false;
-    _readyToScan = false; // not ready yet
-    statusMessage = "Hold steady...";
-    _pressStartTime = DateTime.now();
-  });
+  // ─── AUTO-CLEAR TIMER (Problem 1) ─────────────────────────────────────────
 
-  // Only allow scanning after 500ms of holding
-  Future.delayed(const Duration(milliseconds: 300), () {
-    if (isPressing && mounted) { // only if still pressing
-      setState(() {
-        _readyToScan = true;
-        statusMessage = "Scanning...";
-      });
-    }
-  });
-}
+  void _startResultClearTimer() {
+    _resultClearTimer?.cancel();
+    _resultClearTimer = Timer(const Duration(seconds: 4), () {
+      if (mounted && !isPressing) {
+        // Only clear if user is not actively pressing
+        setState(() {
+          detectedCurrency = "No note detected";
+          currentConfidence = 0.0;
+          isResultLocked = false;
+          statusMessage = "স্ক্রিনে চাপ দিয়ে ধরুন";
+        });
+        print('⏱ Result auto-cleared after 4 seconds');
+      }
+    });
+  }
 
+  // ─── PRESS HANDLERS ───────────────────────────────────────────────────────
+
+  void _onPressStart() {
+    HapticFeedback.lightImpact();
+
+    // Cancel auto-clear timer — user is starting a new scan
+    _resultClearTimer?.cancel();
+
+    setState(() {
+      isPressing = true;
+      isResultLocked = false;
+      _hasPredictedThisPress = false;
+      _hasSpoken = false;
+      _readyToScan = false;
+      statusMessage = "ধরে রাখুন...";
+      _pressStartTime = DateTime.now();
+    });
+
+    Future.delayed(const Duration(milliseconds:10), () {
+      if (isPressing && mounted) {
+        setState(() {
+          _readyToScan = true;
+          statusMessage = "স্ক্যান হচ্ছে...";
+        });
+      }
+    });
+  }
 
   void _onPressEnd() {
-  setState(() {
-    isPressing = false;
-    _readyToScan = false; // reset
-    _hasPredictedThisPress = false;
-    _hasSpoken = false;
-    isResultLocked = false;
-    statusMessage = "Press and hold to scan";
-  });
-}
-  // Handle press end
-// void _onPressEnd() {
-//   setState(() {
-//     isPressing = false;
-//     _hasPredictedThisPress = false;
-//     _hasSpoken = false;
-//     isResultLocked = false;
-//     detectedCurrency = "No note detected";
-//     statusMessage = "Press and hold to scan";
-//   });
-//   print('👆 Press ended — ready for next scan');
-// }
+    setState(() {
+      isPressing = false;
+      _readyToScan = false;
+      _hasPredictedThisPress = false;
+      _hasSpoken = false;
+
+      if (!isResultLocked) {
+        statusMessage = "স্ক্রিনে চাপ দিয়ে ধরুন";
+      } else {
+        statusMessage = "স্ক্রিনে চাপ দিয়ে ধরুন";
+      }
+    });
+  }
+
+  // ─── IMAGE CONVERSION ─────────────────────────────────────────────────────
 
   img.Image? _convertCameraImage(CameraImage image) {
     try {
@@ -424,7 +466,6 @@ void _onPressStart() {
     for (int y = 0; y < 224; y++) {
       for (int x = 0; x < 224; x++) {
         final pixel = image.getPixel(x, y);
-
         input[0][y][x][0] = (pixel.r / 127.5) - 1.0;
         input[0][y][x][1] = (pixel.g / 127.5) - 1.0;
         input[0][y][x][2] = (pixel.b / 127.5) - 1.0;
@@ -434,18 +475,19 @@ void _onPressStart() {
     return input;
   }
 
+  // ─── BUILD ────────────────────────────────────────────────────────────────
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
       backgroundColor: Colors.black,
       body: GestureDetector(
-        // Detect press and hold anywhere on screen
         onTapDown: (_) => _onPressStart(),
         onTapUp: (_) => _onPressEnd(),
         onTapCancel: () => _onPressEnd(),
         child: Column(
           children: [
-            // Upper Part - Live Camera Feed
+            // Upper Part — Live Camera Feed
             Expanded(
               flex: 6,
               child: Stack(
@@ -470,13 +512,13 @@ void _onPressStart() {
                   // Scanning border overlay (when pressing)
                   if (isPressing && !isResultLocked)
                     AnimatedContainer(
-                      duration: Duration(milliseconds: 300),
+                      duration: const Duration(milliseconds: 300),
                       decoration: BoxDecoration(
                         border: Border.all(color: Colors.green, width: 4),
                       ),
                     ),
 
-                  // Success overlay (when locked)
+                  // Success overlay (when result locked)
                   if (isResultLocked)
                     Container(
                       decoration: BoxDecoration(
@@ -484,7 +526,7 @@ void _onPressStart() {
                       ),
                     ),
 
-                  // Top instruction text
+                  // Top status text
                   Positioned(
                     top: MediaQuery.of(context).padding.top + 16,
                     left: 0,
@@ -514,23 +556,20 @@ void _onPressStart() {
                       ),
                     ),
                   ),
-
-                 
-                  
                 ],
               ),
             ),
 
-            // Lower Part - Detection Result Display
+            // Lower Part — Detection Result Display
             Expanded(
               flex: 4,
               child: SafeArea(
                 top: false,
                 child: Container(
                   width: double.infinity,
-                  decoration: BoxDecoration(
+                  decoration: const BoxDecoration(
                     color: Colors.white,
-                    borderRadius: const BorderRadius.only(
+                    borderRadius: BorderRadius.only(
                       topLeft: Radius.circular(30),
                       topRight: Radius.circular(30),
                     ),
@@ -551,8 +590,8 @@ void _onPressStart() {
                             ),
                           ),
                           if (isResultLocked)
-                            Padding(
-                              padding: const EdgeInsets.only(left: 8),
+                            const Padding(
+                              padding: EdgeInsets.only(left: 8),
                               child: Icon(
                                 Icons.check_circle,
                                 color: Colors.green,
@@ -599,7 +638,10 @@ void _onPressStart() {
                           padding: const EdgeInsets.only(top: 12),
                           child: Text(
                             '${(currentConfidence * 100).toStringAsFixed(1)}% confidence',
-                            style: TextStyle(fontSize: 12, color: Colors.grey),
+                            style: const TextStyle(
+                              fontSize: 12,
+                              color: Colors.grey,
+                            ),
                           ),
                         ),
                     ],
@@ -613,8 +655,12 @@ void _onPressStart() {
     );
   }
 
+  // ─── DISPOSE ──────────────────────────────────────────────────────────────
+
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    _resultClearTimer?.cancel();
     _cameraController?.dispose();
     _interpreter?.close();
     _flutterTts.stop();
