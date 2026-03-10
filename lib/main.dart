@@ -90,14 +90,14 @@ class _CurrencyDetectorHomeState extends State<CurrencyDetectorHome>
   @override
   void initState() {
     super.initState();
-    // Register this widget as an observer for app lifecycle changes
+
     WidgetsBinding.instance.addObserver(this);
     _initializeCamera();
     _loadModel();
     _initializeTts();
   }
 
-  // ─── LIFECYCLE OBSERVER (Problem 2 fix) ───────────────────────────────────
+  // ─── LIFECYCLE OBSERVER ───────────────────────────────────
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
@@ -105,10 +105,10 @@ class _CurrencyDetectorHomeState extends State<CurrencyDetectorHome>
 
     if (state == AppLifecycleState.inactive ||
         state == AppLifecycleState.paused) {
-      // App going to background — stop and release camera
+      
       _stopCamera();
     } else if (state == AppLifecycleState.resumed) {
-      // App returning to foreground — reinitialize camera
+      
       _initializeCamera();
     }
   }
@@ -205,7 +205,7 @@ class _CurrencyDetectorHomeState extends State<CurrencyDetectorHome>
 
   Future<void> _speakWelcome() async {
     try {
-      // "Hold a note in front of the camera and press the screen"
+     
       await _flutterTts.speak("ক্যামেরার সামনে নোট ধরুন এবং স্ক্রিনে চাপ দিন");
     } catch (e) {
       print('❌ Error speaking welcome: $e');
@@ -301,7 +301,7 @@ class _CurrencyDetectorHomeState extends State<CurrencyDetectorHome>
       if (confidence >= _confidenceThreshold) {
         _hasPredictedThisPress = true;
 
-        // Cancel any existing clear timer (user pressed before it expired)
+        
         _resultClearTimer?.cancel();
 
         HapticFeedback.mediumImpact();
@@ -317,7 +317,7 @@ class _CurrencyDetectorHomeState extends State<CurrencyDetectorHome>
 
         await _speak(predictedLabel);
 
-        // Start 4-second auto-clear timer (Problem 1)
+        
         _startResultClearTimer();
       } else {
         if (mounted) {
@@ -337,7 +337,7 @@ class _CurrencyDetectorHomeState extends State<CurrencyDetectorHome>
     }
   }
 
-  // ─── AUTO-CLEAR TIMER (Problem 1) ─────────────────────────────────────────
+ 
 
   void _startResultClearTimer() {
     _resultClearTimer?.cancel();
@@ -360,7 +360,7 @@ class _CurrencyDetectorHomeState extends State<CurrencyDetectorHome>
   void _onPressStart() {
     HapticFeedback.lightImpact();
 
-    // Cancel auto-clear timer — user is starting a new scan
+    
     _resultClearTimer?.cancel();
 
     setState(() {
